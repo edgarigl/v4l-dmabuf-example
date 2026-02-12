@@ -18,6 +18,7 @@ struct capture_buffer {
     void *addr;
     size_t len;
     uint32_t offset;
+    /* Handle metadata is created lazily on first frame for this queue index. */
     bool exported;
     uint64_t handle_id;
 };
@@ -167,6 +168,10 @@ static int setup_mmap_capture(int vfd, struct sender_cfg *cfg, struct capture_bu
 
         bufs[i].len = buf.length;
         bufs[i].offset = buf.m.offset;
+        /*
+         * MMAP is used here because these queue buffers are what we export as
+         * cross-guest handles.
+         */
         bufs[i].addr = mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
                             MAP_SHARED, vfd, buf.m.offset);
         if (bufs[i].addr == MAP_FAILED) {
@@ -227,6 +232,10 @@ static int export_handle_for_buffer(int vfd, uint32_t queue_type,
     exp.flags = 0;
     exp.dmabuf_fd = -1;
 
+    /*
+     * Driver-private export ioctl: maps a local queue buffer index to an
+     * opaque shareable handle understood by peer guests.
+     */
     if (xioctl(vfd, VIDIOC_VIRTIO_MEDIA_EXPORT_BUFFER, &exp) < 0) {
         fprintf(stderr, "VIDIOC_VIRTIO_MEDIA_EXPORT_BUFFER(index=%u) failed: %s\n",
                 index, strerror(errno));
@@ -292,7 +301,7 @@ int main(int argc, char **argv)
         goto out;
     }
 
-    /* Queue all capture buffers before STREAMON. */
+    /* Queue all capture buffers before STREAMON to start a steady pipeline. */
     for (i = 0; i < cfg.buffers; i++) {
         if (queue_index(vfd, i) < 0) {
             goto out;
@@ -366,6 +375,10 @@ int main(int argc, char **argv)
             bytesused = (uint32_t)bufs[buf.index].len;
         }
 
+        /*
+         * Zero-copy control packet: only metadata and handle_id go over TCP.
+         * The pixels stay in shared memory backed by that handle.
+         */
         pkt.magic = FRAME_MAGIC;
         pkt.buffer_index = buf.index;
         pkt.bytesused = bytesused;

@@ -23,6 +23,7 @@ Builds binaries:
 - `sender_zc`
 - `receiver_zc`
 - `receiver_sdl` (only if `sdl2` development package is available)
+- `receiver_zc_sdl` (only if `sdl2` development package is available)
 
 ## Flow 1: Payload Copy Over TCP
 
@@ -116,6 +117,15 @@ Options:
 - `-p <port>` listen port (required)
 - `-o <path>` optional raw output file for verification
 - `-n <frames>` stop after N frames (default unlimited)
+
+Live display variant:
+
+```bash
+./receiver_zc_sdl -d /dev/video0 -p 3344
+```
+
+`receiver_zc_sdl` imports handles exactly like `receiver_zc`, but displays
+imported frames with SDL instead of only optional file output.
 
 ### Sender (Guest A)
 

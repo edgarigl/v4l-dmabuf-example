@@ -3,5 +3,6 @@ receiver
 sender_zc
 receiver_zc
 receiver_sdl
+receiver_zc_sdl
 *.o
 *.raw

@@ -1,6 +1,8 @@
 #include "common.h"
 #include "virtio_media_uapi.h"
 
+#include <SDL2/SDL.h>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -14,7 +16,6 @@
 #include <unistd.h>
 
 struct import_entry {
-    /* handle_id is stable across frames and maps to one imported dmabuf. */
     uint64_t handle_id;
     int dmabuf_fd;
     void *addr;
@@ -27,6 +28,13 @@ struct receiver_cfg {
     const char *output_path;
     uint16_t port;
     int frame_limit;
+};
+
+struct display_ctx {
+    SDL_Window *window;
+    SDL_Renderer *renderer;
+    SDL_Texture *texture;
+    int pitch;
 };
 
 static void usage(const char *prog)
@@ -86,6 +94,116 @@ static int parse_args(int argc, char **argv, struct receiver_cfg *cfg)
     return 0;
 }
 
+static int map_fourcc_to_sdl(uint32_t fourcc, uint32_t *sdl_fmt,
+                             int *pitch, uint32_t width)
+{
+    switch (fourcc) {
+    case V4L2_PIX_FMT_YUYV:
+        *sdl_fmt = SDL_PIXELFORMAT_YUY2;
+        *pitch = (int)width * 2;
+        return 0;
+    case V4L2_PIX_FMT_UYVY:
+        *sdl_fmt = SDL_PIXELFORMAT_UYVY;
+        *pitch = (int)width * 2;
+        return 0;
+    case V4L2_PIX_FMT_YVYU:
+        *sdl_fmt = SDL_PIXELFORMAT_YVYU;
+        *pitch = (int)width * 2;
+        return 0;
+    default:
+        return -1;
+    }
+}
+
+static int display_init(struct display_ctx *disp, const struct stream_hello *hello)
+{
+    uint32_t sdl_fmt;
+
+    memset(disp, 0, sizeof(*disp));
+
+    if (map_fourcc_to_sdl(hello->pixelformat, &sdl_fmt, &disp->pitch,
+                          hello->width) < 0) {
+        char fourcc[5];
+        fourcc_to_text(hello->pixelformat, fourcc);
+        fprintf(stderr, "unsupported pixel format for SDL display: %s\n", fourcc);
+        return -1;
+    }
+
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        return -1;
+    }
+
+    disp->window = SDL_CreateWindow("v4l-dmabuf receiver_zc_sdl",
+                                    SDL_WINDOWPOS_CENTERED,
+                                    SDL_WINDOWPOS_CENTERED,
+                                    (int)hello->width,
+                                    (int)hello->height,
+                                    0);
+    if (!disp->window) {
+        fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+        return -1;
+    }
+
+    disp->renderer = SDL_CreateRenderer(disp->window, -1,
+                                        SDL_RENDERER_ACCELERATED |
+                                            SDL_RENDERER_PRESENTVSYNC);
+    if (!disp->renderer) {
+        disp->renderer = SDL_CreateRenderer(disp->window, -1,
+                                            SDL_RENDERER_SOFTWARE);
+    }
+    if (!disp->renderer) {
+        fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        return -1;
+    }
+
+    disp->texture = SDL_CreateTexture(disp->renderer,
+                                      sdl_fmt,
+                                      SDL_TEXTUREACCESS_STREAMING,
+                                      (int)hello->width,
+                                      (int)hello->height);
+    if (!disp->texture) {
+        fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
+        return -1;
+    }
+
+    return 0;
+}
+
+static void display_destroy(struct display_ctx *disp)
+{
+    if (disp->texture) {
+        SDL_DestroyTexture(disp->texture);
+    }
+    if (disp->renderer) {
+        SDL_DestroyRenderer(disp->renderer);
+    }
+    if (disp->window) {
+        SDL_DestroyWindow(disp->window);
+    }
+
+    SDL_Quit();
+}
+
+static int display_frame(struct display_ctx *disp, const void *pixels)
+{
+    if (SDL_UpdateTexture(disp->texture, NULL, pixels, disp->pitch) != 0) {
+        fprintf(stderr, "SDL_UpdateTexture failed: %s\n", SDL_GetError());
+        return -1;
+    }
+    if (SDL_RenderClear(disp->renderer) != 0) {
+        fprintf(stderr, "SDL_RenderClear failed: %s\n", SDL_GetError());
+        return -1;
+    }
+    if (SDL_RenderCopy(disp->renderer, disp->texture, NULL, NULL) != 0) {
+        fprintf(stderr, "SDL_RenderCopy failed: %s\n", SDL_GetError());
+        return -1;
+    }
+
+    SDL_RenderPresent(disp->renderer);
+    return 0;
+}
+
 static struct import_entry *find_entry(struct import_entry *entries,
                                        size_t count,
                                        uint64_t handle_id)
@@ -108,12 +226,9 @@ static int import_handle(int vfd, uint64_t handle_id, struct import_entry *entry
     memset(&imp, 0, sizeof(imp));
     imp.handle_id = handle_id;
 
-    /*
-     * Driver-private import ioctl: resolves a remote handle into a local
-     * dmabuf fd backed by shared pages.
-     */
     if (xioctl(vfd, VIDIOC_VIRTIO_MEDIA_IMPORT_BUFFER, &imp) < 0) {
-        fprintf(stderr, "VIDIOC_VIRTIO_MEDIA_IMPORT_BUFFER(handle=%" PRIu64 ") failed: %s\n",
+        fprintf(stderr,
+                "VIDIOC_VIRTIO_MEDIA_IMPORT_BUFFER(handle=%" PRIu64 ") failed: %s\n",
                 handle_id, strerror(errno));
         return -1;
     }
@@ -158,7 +273,6 @@ static int ensure_entry(int vfd,
         return 0;
     }
 
-    /* Grow a tiny cache so repeated frames don't re-import the same handle. */
     if (*count == *capacity) {
         size_t new_cap = (*capacity == 0) ? 8 : (*capacity * 2);
         struct import_entry *new_entries = realloc(*entries,
@@ -173,6 +287,7 @@ static int ensure_entry(int vfd,
     entry = &(*entries)[*count];
     memset(entry, 0, sizeof(*entry));
     entry->dmabuf_fd = -1;
+
     if (import_handle(vfd, handle_id, entry) < 0) {
         return -1;
     }
@@ -216,6 +331,7 @@ int main(int argc, char **argv)
     struct import_entry *entries = NULL;
     size_t entry_count = 0;
     size_t entry_capacity = 0;
+    struct display_ctx disp;
     struct timeval start_tv = {0};
     struct timeval now_tv;
     uint64_t frames = 0;
@@ -223,6 +339,7 @@ int main(int argc, char **argv)
     int sock = -1;
     int out_fd = -1;
     int rc = 1;
+    bool display_ok = false;
 
     if (parse_args(argc, argv, &cfg) < 0) {
         return 1;
@@ -250,8 +367,14 @@ int main(int argc, char **argv)
         goto out;
     }
 
+    if (display_init(&disp, &hello) < 0) {
+        goto out;
+    }
+    display_ok = true;
+
     if (cfg.output_path) {
-        out_fd = open(cfg.output_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
+        out_fd = open(cfg.output_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC,
+                      0644);
         if (out_fd < 0) {
             fprintf(stderr, "failed to open output %s: %s\n",
                     cfg.output_path, strerror(errno));
@@ -263,7 +386,7 @@ int main(int argc, char **argv)
         char fourcc[5];
         fourcc_to_text(hello.pixelformat, fourcc);
         fprintf(stderr,
-                "zero-copy receiver: %s listening on %s:%u (%ux%u %s)\n",
+                "zero-copy receiver SDL: %s listening on %s:%u (%ux%u %s)\n",
                 cfg.device, cfg.bind_ip, cfg.port,
                 hello.width, hello.height, fourcc);
     }
@@ -276,6 +399,15 @@ int main(int argc, char **argv)
         struct zc_ack_packet ack;
         struct zc_ack_packet ack_net;
         struct import_entry *entry;
+        SDL_Event ev;
+
+        /* Keep the window responsive while waiting for new frame metadata. */
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                rc = 0;
+                goto out;
+            }
+        }
 
         if (recv_all(sock, &pkt_net, sizeof(pkt_net)) < 0) {
             fprintf(stderr, "stream closed\n");
@@ -302,9 +434,13 @@ int main(int argc, char **argv)
         }
 
         /*
-         * Zero-copy path: payload is already in shared memory mapped by import.
-         * We only optionally copy out to a file for verification.
+         * Zero-copy display: pixels are read directly from imported shared
+         * memory; no frame payload traverses TCP.
          */
+        if (display_frame(&disp, entry->addr) < 0) {
+            goto out;
+        }
+
         if (out_fd >= 0) {
             ssize_t wr = write(out_fd, entry->addr, pkt.bytesused);
             if (wr < 0 || (uint32_t)wr != pkt.bytesused) {
@@ -314,8 +450,8 @@ int main(int argc, char **argv)
         }
 
         /*
-         * ACK is the ownership hand-off back to sender for this frame.
-         * Sender requeues only after receiving this packet.
+         * ACK indicates that receiver finished reading this frame and sender
+         * can safely requeue the originating capture buffer.
          */
         ack.magic = FRAME_MAGIC;
         ack.status = 0;
@@ -335,7 +471,7 @@ int main(int argc, char **argv)
             double elapsed = (now_tv.tv_sec - start_tv.tv_sec) +
                              (now_tv.tv_usec - start_tv.tv_usec) / 1000000.0;
             fprintf(stderr,
-                    "receiver_zc fps: %.2f (%" PRIu64 " frames, %zu handles imported)\n",
+                    "receiver_zc_sdl fps: %.2f (%" PRIu64 " frames, %zu handles imported)\n",
                     frames / elapsed, frames, entry_count);
         }
     }
@@ -344,6 +480,9 @@ int main(int argc, char **argv)
 out:
     if (out_fd >= 0) {
         close(out_fd);
+    }
+    if (display_ok) {
+        display_destroy(&disp);
     }
     cleanup_entries(vfd, entries, entry_count);
     if (sock >= 0) {
