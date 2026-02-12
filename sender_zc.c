@@ -5,6 +5,9 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/videodev2.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -34,6 +37,7 @@ struct sender_cfg {
     uint32_t buffers;
     int frame_limit;
     int ack_timeout_ms;
+    int connect_timeout_ms;
 };
 
 static void usage(const char *prog)
@@ -49,8 +53,77 @@ static void usage(const char *prog)
             "  -f <fourcc>   Pixel format (default YUYV)\n"
             "  -b <count>    Buffer count (default 4)\n"
             "  -n <frames>   Stop after N frames (default: unlimited)\n"
-            "  -k <ms>       ACK wait timeout in milliseconds (default 200)\n",
+            "  -k <ms>       ACK wait timeout in milliseconds (default 200)\n"
+            "  -t <ms>       TCP connect timeout in milliseconds (default 3000)\n",
             prog);
+}
+
+static int tcp_connect_timeout(const char *ip, uint16_t port, int timeout_ms)
+{
+    struct sockaddr_in addr;
+    struct pollfd pfd;
+    int fd;
+    int flags;
+    int ret;
+    int soerr = 0;
+    socklen_t soerr_len = sizeof(soerr);
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    ret = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret == 0) {
+        (void)fcntl(fd, F_SETFL, flags);
+        return fd;
+    }
+    if (errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    ret = poll(&pfd, 1, timeout_ms);
+    if (ret <= 0) {
+        if (ret == 0) {
+            errno = ETIMEDOUT;
+        }
+        close(fd);
+        return -1;
+    }
+
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerr_len) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (soerr != 0) {
+        errno = soerr;
+        close(fd);
+        return -1;
+    }
+
+    if (fcntl(fd, F_SETFL, flags) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
 }
 
 static int parse_args(int argc, char **argv, struct sender_cfg *cfg)
@@ -67,9 +140,10 @@ static int parse_args(int argc, char **argv, struct sender_cfg *cfg)
         .buffers = 4,
         .frame_limit = -1,
         .ack_timeout_ms = 200,
+        .connect_timeout_ms = 3000,
     };
 
-    while ((c = getopt(argc, argv, "d:a:p:W:H:f:b:n:k:h")) != -1) {
+    while ((c = getopt(argc, argv, "d:a:p:W:H:f:b:n:k:t:h")) != -1) {
         switch (c) {
         case 'd':
             cfg->device = optarg;
@@ -99,6 +173,13 @@ static int parse_args(int argc, char **argv, struct sender_cfg *cfg)
             cfg->ack_timeout_ms = (int)strtol(optarg, NULL, 10);
             if (cfg->ack_timeout_ms < 0) {
                 fprintf(stderr, "ack timeout must be >= 0\n");
+                return -1;
+            }
+            break;
+        case 't':
+            cfg->connect_timeout_ms = (int)strtol(optarg, NULL, 10);
+            if (cfg->connect_timeout_ms <= 0) {
+                fprintf(stderr, "connect timeout must be > 0\n");
                 return -1;
             }
             break;
@@ -328,8 +409,11 @@ int main(int argc, char **argv)
         }
     }
 
-    sock = tcp_connect(cfg.peer_ip, cfg.port);
+    fprintf(stderr, "sender_zc: connecting to %s:%u (timeout=%dms)\n",
+            cfg.peer_ip, cfg.port, cfg.connect_timeout_ms);
+    sock = tcp_connect_timeout(cfg.peer_ip, cfg.port, cfg.connect_timeout_ms);
     if (sock < 0) {
+        fprintf(stderr, "connect failed: %s\n", strerror(errno));
         goto out;
     }
 

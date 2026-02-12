@@ -144,6 +144,7 @@ Options:
 - `-b <count>` MMAP buffer count (default `4`)
 - `-n <frames>` stop after N frames (default unlimited)
 - `-k <ms>` ACK wait timeout in ms (default `200`)
+- `-t <ms>` TCP connect timeout in ms (default `3000`)
 
 ### Synchronization model
 
