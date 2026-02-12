@@ -31,6 +31,28 @@ struct frame_packet {
     uint64_t ts_usec;
 };
 
+/*
+ * Control packets for handle-based zero-copy sharing.
+ * Payload bytes are not sent over TCP in this mode.
+ */
+struct zc_frame_packet {
+    uint32_t magic;
+    uint32_t buffer_index;
+    uint32_t bytesused;
+    uint32_t flags;
+    uint64_t handle_id;
+    uint64_t sequence;
+    uint64_t ts_sec;
+    uint64_t ts_usec;
+};
+
+struct zc_ack_packet {
+    uint32_t magic;
+    uint32_t status;
+    uint64_t handle_id;
+    uint64_t sequence;
+};
+
 int xioctl(int fd, unsigned long request, void *arg);
 int open_v4l2_device(const char *path);
 
@@ -52,5 +74,9 @@ void host_to_net_hello(struct stream_hello *dst, const struct stream_hello *src)
 void net_to_host_hello(struct stream_hello *dst, const struct stream_hello *src);
 void host_to_net_frame(struct frame_packet *dst, const struct frame_packet *src);
 void net_to_host_frame(struct frame_packet *dst, const struct frame_packet *src);
+void host_to_net_zc_frame(struct zc_frame_packet *dst, const struct zc_frame_packet *src);
+void net_to_host_zc_frame(struct zc_frame_packet *dst, const struct zc_frame_packet *src);
+void host_to_net_zc_ack(struct zc_ack_packet *dst, const struct zc_ack_packet *src);
+void net_to_host_zc_ack(struct zc_ack_packet *dst, const struct zc_ack_packet *src);
 
 #endif

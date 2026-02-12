@@ -1,28 +1,14 @@
 # v4l-dmabuf-example
 
-Minimal sender/receiver example that demonstrates:
+This repository contains two different sender/receiver flows.
 
-- Allocating capture buffers as DMABUFs (`/dev/dma_heap/system` by default).
-- Capturing video from a V4L2 device with `V4L2_MEMORY_DMABUF`.
-- Sending frame metadata and frame payload over a TCP/IP socket to another guest.
-- Reconstructing received frames into DMABUFs on the receiver side.
+- Payload-copy flow (`sender`, `receiver`, `receiver_sdl`): sends frame bytes over TCP.
+- Handle-based zero-copy flow (`sender_zc`, `receiver_zc`): sends only control packets over TCP and shares frame buffers through virtio-media export/import handles.
 
-This is meant for two separate guests:
+Both flows are intended for two separate guests:
 
-- Guest A runs `sender` and captures from `/dev/videoX`.
-- Guest B runs `receiver` and accepts frames over TCP.
-
-## Important note
-
-A DMABUF file descriptor itself cannot be transferred over TCP/IP. This example
-uses TCP as a transport for:
-
-- Per-stream metadata (format, dimensions, buffer count).
-- Per-frame metadata (buffer index, bytesused, sequence, timestamp).
-- Raw frame bytes copied from sender DMABUF mapping into receiver DMABUF mapping.
-
-So this is not cross-guest zero-copy. It is a practical transport pattern using
-DMABUF-backed buffers at both ends.
+- Guest A captures video from `/dev/videoX`.
+- Guest B receives frames.
 
 ## Build
 
@@ -34,11 +20,21 @@ Builds binaries:
 
 - `sender`
 - `receiver`
+- `sender_zc`
+- `receiver_zc`
 - `receiver_sdl` (only if `sdl2` development package is available)
 
-## Usage
+## Flow 1: Payload Copy Over TCP
 
-### 1. Start receiver on Guest B
+### What it demonstrates
+
+- DMABUF-backed or MMAP-backed capture in Guest A.
+- Frame metadata and frame payload sent over TCP/IP.
+- Receiver writes payload into its local DMABUF mappings.
+
+This is not cross-guest zero-copy.
+
+### Receiver (Guest B)
 
 ```bash
 ./receiver -p 9000 -o /tmp/capture.raw
@@ -49,23 +45,17 @@ Options:
 - `-l <ip>` listen address (default `0.0.0.0`)
 - `-p <port>` listen port (required)
 - `-e <heap>` DMA heap (default `/dev/dma_heap/system`)
-- `-o <path>` optional output raw dump
+- `-o <path>` optional raw output file
 
-### 1b. Start live SDL receiver on Guest B (optional)
+Optional live display receiver:
 
 ```bash
 ./receiver_sdl -p 9000
 ```
 
-Options:
-
-- `-l <ip>` listen address (default `0.0.0.0`)
-- `-p <port>` listen port (required)
-- `-e <heap>` DMA heap (default `/dev/dma_heap/system`)
-
 Supported live display formats in `receiver_sdl`: `YUYV`, `UYVY`, `YVYU`.
 
-### 2. Start sender on Guest A
+### Sender (Guest A)
 
 ```bash
 ./sender -d /dev/video0 -a 10.0.0.2 -p 9000 -W 640 -H 480 -f YUYV -b 4
@@ -79,47 +69,81 @@ Options:
 - `-W <width>` capture width (default `640`)
 - `-H <height>` capture height (default `480`)
 - `-f <fourcc>` pixel format as 4 chars (default `YUYV`)
-- `-b <count>` DMABUF count (default `4`)
+- `-b <count>` buffer count (default `4`)
 - `-n <frames>` stop after N frames (default unlimited)
 - `-e <heap>` DMA heap (default `/dev/dma_heap/system`)
 - `-m <mode>` capture memory mode: `auto` (default), `dmabuf`, `mmap`
 
 `auto` first tries `V4L2_MEMORY_DMABUF` and falls back to `V4L2_MEMORY_MMAP`
-if the driver rejects DMABUF at setup (`REQBUFS`) or queueing (`QBUF`).
+if DMABUF is rejected during `REQBUFS` or `QBUF`.
 
-## Quick validation
-
-After capture, on receiver you can inspect the raw dump with ffplay:
+### Quick validation
 
 ```bash
 ffplay -f rawvideo -pixel_format yuyv422 -video_size 640x480 /tmp/capture.raw
 ```
 
-Adjust `pixel_format` and `video_size` to match the sender settings.
+Adjust format/size to match sender settings.
 
-## How this maps to virtio-media experiments
+## Flow 2: Handle-Based Zero-Copy (virtio-media extension)
 
-This example demonstrates user space behavior only. It does not require private
-virtio-media ioctls and does not move grant references. It is useful as a
-baseline for comparing capture path behavior across KVM/Xen and for validating
-that the application-level transport logic is sound.
+### What it demonstrates
 
-If your capture node fails with:
+- Guest A captures with `V4L2_MEMORY_MMAP`.
+- Guest A exports queue buffers via private virtio-media ioctl (`VIDIOC_VIRTIO_MEDIA_EXPORT_BUFFER`).
+- Sender transmits only metadata + `handle_id` over TCP.
+- Guest B imports handles via private virtio-media ioctl (`VIDIOC_VIRTIO_MEDIA_IMPORT_BUFFER`).
+- Guest B maps imported DMABUFs and reads frames directly from shared memory.
 
-- `VIDIOC_REQBUFS(DMABUF) failed: Invalid argument`
+No frame payload bytes are sent over TCP in this flow.
 
-run sender in fallback mode:
+### Requirements
+
+- Out-of-tree virtio-media driver/QEMU implementation with export/import support.
+- Private ioctls from `virtio_media_uapi.h` available in the running guest driver.
+- Both guests connected to compatible virtio-media backend setup.
+
+### Receiver (Guest B)
 
 ```bash
-./sender -d /dev/video0 -a <receiver-ip> -p 9000 -m mmap
+./receiver_zc -d /dev/video0 -p 3344 -o /tmp/capture-zc.raw
 ```
+
+Options:
+
+- `-d <dev>` virtio-media device used for import ioctls (default `/dev/video0`)
+- `-l <ip>` listen address (default `0.0.0.0`)
+- `-p <port>` listen port (required)
+- `-o <path>` optional raw output file for verification
+- `-n <frames>` stop after N frames (default unlimited)
+
+### Sender (Guest A)
+
+```bash
+./sender_zc -d /dev/video0 -a 10.0.3.16 -p 3344 -W 640 -H 480 -f YUYV -b 4
+```
+
+Options:
+
+- `-d <dev>` capture device (default `/dev/video0`)
+- `-a <ip>` receiver IP (required)
+- `-p <port>` receiver port (required)
+- `-W <width>` capture width (default `640`)
+- `-H <height>` capture height (default `480`)
+- `-f <fourcc>` pixel format as 4 chars (default `YUYV`)
+- `-b <count>` MMAP buffer count (default `4`)
+- `-n <frames>` stop after N frames (default unlimited)
+
+### Synchronization model
+
+`sender_zc` waits for one ACK from `receiver_zc` per frame before requeueing the
+capture buffer. This is a simple ownership protocol for demos where explicit
+cross-guest fence support is not available.
 
 ## SDL/DRM and virtio-gpu
 
-`receiver_sdl` can exercise `virtio-gpu` in the receiver guest, but it depends
-on SDL backend selection:
+`receiver_sdl` can exercise `virtio-gpu` in the receiver guest, depending on
+SDL backend selection:
 
-- `SDL_VIDEODRIVER=kmsdrm` uses DRM/KMS directly and hits the guest DRM device
-  (typically `virtio-gpu` when that is your virtual GPU).
-- `SDL_VIDEODRIVER=x11` or `wayland` goes through a compositor/display server;
-  this is usually indirect from the app point of view.
+- `SDL_VIDEODRIVER=kmsdrm` uses DRM/KMS directly and typically hits guest `virtio-gpu`.
+- `SDL_VIDEODRIVER=x11` or `wayland` is usually indirect via compositor/display server.

@@ -298,3 +298,43 @@ void net_to_host_frame(struct frame_packet *dst, const struct frame_packet *src)
     dst->ts_sec = ntohll_u64(src->ts_sec);
     dst->ts_usec = ntohll_u64(src->ts_usec);
 }
+
+void host_to_net_zc_frame(struct zc_frame_packet *dst, const struct zc_frame_packet *src)
+{
+    dst->magic = htonl(src->magic);
+    dst->buffer_index = htonl(src->buffer_index);
+    dst->bytesused = htonl(src->bytesused);
+    dst->flags = htonl(src->flags);
+    dst->handle_id = htonll_u64(src->handle_id);
+    dst->sequence = htonll_u64(src->sequence);
+    dst->ts_sec = htonll_u64(src->ts_sec);
+    dst->ts_usec = htonll_u64(src->ts_usec);
+}
+
+void net_to_host_zc_frame(struct zc_frame_packet *dst, const struct zc_frame_packet *src)
+{
+    dst->magic = ntohl(src->magic);
+    dst->buffer_index = ntohl(src->buffer_index);
+    dst->bytesused = ntohl(src->bytesused);
+    dst->flags = ntohl(src->flags);
+    dst->handle_id = ntohll_u64(src->handle_id);
+    dst->sequence = ntohll_u64(src->sequence);
+    dst->ts_sec = ntohll_u64(src->ts_sec);
+    dst->ts_usec = ntohll_u64(src->ts_usec);
+}
+
+void host_to_net_zc_ack(struct zc_ack_packet *dst, const struct zc_ack_packet *src)
+{
+    dst->magic = htonl(src->magic);
+    dst->status = htonl(src->status);
+    dst->handle_id = htonll_u64(src->handle_id);
+    dst->sequence = htonll_u64(src->sequence);
+}
+
+void net_to_host_zc_ack(struct zc_ack_packet *dst, const struct zc_ack_packet *src)
+{
+    dst->magic = ntohl(src->magic);
+    dst->status = ntohl(src->status);
+    dst->handle_id = ntohll_u64(src->handle_id);
+    dst->sequence = ntohll_u64(src->sequence);
+}

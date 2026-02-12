@@ -1,5 +1,7 @@
 sender
 receiver
+sender_zc
+receiver_zc
 receiver_sdl
 *.o
 *.raw
