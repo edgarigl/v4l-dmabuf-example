@@ -207,6 +207,17 @@ static int request_capture_buffers(int vfd, uint32_t *count, enum v4l2_memory me
     return 0;
 }
 
+static void release_capture_buffers(int vfd, enum v4l2_memory memory)
+{
+    struct v4l2_requestbuffers req = {
+        .count = 0,
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .memory = memory,
+    };
+
+    xioctl(vfd, VIDIOC_REQBUFS, &req);
+}
+
 static int queue_buffer(int vfd, unsigned int index, const struct buffer_ctx *b,
                         enum v4l2_memory memory)
 {
@@ -326,6 +337,91 @@ static void cleanup_buffers(struct buffer_ctx *bufs, uint32_t count)
     }
 }
 
+static struct buffer_ctx *alloc_buffer_array(uint32_t count)
+{
+    struct buffer_ctx *bufs;
+    uint32_t i;
+
+    bufs = calloc(count, sizeof(*bufs));
+    if (!bufs) {
+        return NULL;
+    }
+
+    for (i = 0; i < count; i++) {
+        bufs[i].fd = -1;
+    }
+
+    return bufs;
+}
+
+static int prepare_dmabuf_pipeline(int vfd, struct sender_cfg *cfg,
+                                   struct v4l2_format *fmt,
+                                   struct buffer_ctx **out_bufs)
+{
+    uint32_t requested = cfg->buffers;
+    struct buffer_ctx *bufs;
+
+    if (request_capture_buffers(vfd, &requested, V4L2_MEMORY_DMABUF) < 0) {
+        return -1;
+    }
+
+    cfg->buffers = requested;
+    bufs = alloc_buffer_array(cfg->buffers);
+    if (!bufs) {
+        errno = ENOMEM;
+        release_capture_buffers(vfd, V4L2_MEMORY_DMABUF);
+        return -1;
+    }
+
+    if (setup_dmabufs(cfg, bufs, cfg->buffers, fmt->fmt.pix.sizeimage) < 0) {
+        cleanup_buffers(bufs, cfg->buffers);
+        free(bufs);
+        release_capture_buffers(vfd, V4L2_MEMORY_DMABUF);
+        return -1;
+    }
+
+    *out_bufs = bufs;
+    return 0;
+}
+
+static int prepare_mmap_pipeline(int vfd, struct sender_cfg *cfg,
+                                 struct buffer_ctx **out_bufs,
+                                 uint32_t *out_exported)
+{
+    uint32_t requested = cfg->buffers;
+    struct buffer_ctx *bufs;
+    uint32_t i;
+
+    if (request_capture_buffers(vfd, &requested, V4L2_MEMORY_MMAP) < 0) {
+        return -1;
+    }
+
+    cfg->buffers = requested;
+    bufs = alloc_buffer_array(cfg->buffers);
+    if (!bufs) {
+        errno = ENOMEM;
+        release_capture_buffers(vfd, V4L2_MEMORY_MMAP);
+        return -1;
+    }
+
+    if (setup_mmap_buffers(vfd, bufs, cfg->buffers) < 0) {
+        cleanup_buffers(bufs, cfg->buffers);
+        free(bufs);
+        release_capture_buffers(vfd, V4L2_MEMORY_MMAP);
+        return -1;
+    }
+
+    *out_exported = 0;
+    for (i = 0; i < cfg->buffers; i++) {
+        if (bufs[i].fd >= 0) {
+            (*out_exported)++;
+        }
+    }
+
+    *out_bufs = bufs;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     struct sender_cfg cfg;
@@ -336,11 +432,10 @@ int main(int argc, char **argv)
     struct timeval start_tv = {0};
     struct timeval now_tv;
     uint64_t frames = 0;
-    uint32_t requested;
     uint32_t i;
     uint32_t exported = 0;
     enum v4l2_memory mem = V4L2_MEMORY_DMABUF;
-    bool tried_dmabuf = false;
+    bool fallback_from_dmabuf = false;
     int vfd = -1;
     int sock = -1;
     int rc = 1;
@@ -358,63 +453,48 @@ int main(int argc, char **argv)
         goto out;
     }
 
-    requested = cfg.buffers;
-
     if (cfg.mem_mode != SENDER_MEM_MMAP) {
-        tried_dmabuf = true;
-        if (request_capture_buffers(vfd, &requested, V4L2_MEMORY_DMABUF) == 0) {
+        if (prepare_dmabuf_pipeline(vfd, &cfg, &fmt, &bufs) == 0) {
             mem = V4L2_MEMORY_DMABUF;
-            cfg.buffers = requested;
         } else if (cfg.mem_mode == SENDER_MEM_DMABUF) {
-            fprintf(stderr, "VIDIOC_REQBUFS(DMABUF) failed: %s\n", strerror(errno));
+            fprintf(stderr, "VIDIOC_REQBUFS/SETUP(DMABUF) failed: %s\n", strerror(errno));
             goto out;
         }
     }
 
-    if ((cfg.mem_mode == SENDER_MEM_MMAP) ||
-        (tried_dmabuf && mem != V4L2_MEMORY_DMABUF)) {
+    if (!bufs) {
         if (cfg.mem_mode == SENDER_MEM_AUTO) {
             fprintf(stderr,
-                    "VIDIOC_REQBUFS(DMABUF) not supported, falling back to MMAP path\n");
+                    "DMABUF setup not supported, falling back to MMAP path\n");
         }
-
-        requested = cfg.buffers;
-        if (request_capture_buffers(vfd, &requested, V4L2_MEMORY_MMAP) < 0) {
-            fprintf(stderr, "VIDIOC_REQBUFS(MMAP) failed: %s\n", strerror(errno));
+        if (prepare_mmap_pipeline(vfd, &cfg, &bufs, &exported) < 0) {
+            fprintf(stderr, "VIDIOC_REQBUFS/SETUP(MMAP) failed: %s\n", strerror(errno));
             goto out;
         }
         mem = V4L2_MEMORY_MMAP;
-        cfg.buffers = requested;
     }
 
-    bufs = calloc(cfg.buffers, sizeof(*bufs));
-    if (!bufs) {
-        fprintf(stderr, "calloc buffers failed\n");
-        goto out;
-    }
-
-    for (i = 0; i < cfg.buffers; i++) {
-        bufs[i].fd = -1;
-    }
-
-    if (mem == V4L2_MEMORY_DMABUF) {
-        if (setup_dmabufs(&cfg, bufs, cfg.buffers, fmt.fmt.pix.sizeimage) < 0) {
-            goto out;
-        }
-    } else {
-        if (setup_mmap_buffers(vfd, bufs, cfg.buffers) < 0) {
-            goto out;
-        }
-        for (i = 0; i < cfg.buffers; i++) {
-            if (bufs[i].fd >= 0) {
-                exported++;
-            }
-        }
-    }
-
+prime_queue:
     /* Prime the capture queue with all available buffers before STREAMON. */
     for (i = 0; i < cfg.buffers; i++) {
         if (queue_buffer(vfd, i, &bufs[i], mem) < 0) {
+            if (cfg.mem_mode == SENDER_MEM_AUTO &&
+                mem == V4L2_MEMORY_DMABUF &&
+                !fallback_from_dmabuf) {
+                fprintf(stderr,
+                        "QBUF in DMABUF mode failed, retrying with MMAP path\n");
+                fallback_from_dmabuf = true;
+                cleanup_buffers(bufs, cfg.buffers);
+                free(bufs);
+                bufs = NULL;
+                release_capture_buffers(vfd, V4L2_MEMORY_DMABUF);
+                if (prepare_mmap_pipeline(vfd, &cfg, &bufs, &exported) < 0) {
+                    fprintf(stderr, "MMAP fallback setup failed: %s\n", strerror(errno));
+                    goto out;
+                }
+                mem = V4L2_MEMORY_MMAP;
+                goto prime_queue;
+            }
             goto out;
         }
     }

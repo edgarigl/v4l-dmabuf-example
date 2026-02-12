@@ -85,7 +85,7 @@ Options:
 - `-m <mode>` capture memory mode: `auto` (default), `dmabuf`, `mmap`
 
 `auto` first tries `V4L2_MEMORY_DMABUF` and falls back to `V4L2_MEMORY_MMAP`
-if the driver rejects DMABUF `REQBUFS`.
+if the driver rejects DMABUF at setup (`REQBUFS`) or queueing (`QBUF`).
 
 ## Quick validation
 
