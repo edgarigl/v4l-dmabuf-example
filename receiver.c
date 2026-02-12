@@ -92,6 +92,7 @@ static int setup_dmabufs(const struct receiver_cfg *cfg,
         return -1;
     }
 
+    /* Receiver keeps its own DMABUF pool and copies TCP payload into it. */
     for (i = 0; i < count; i++) {
         bufs[i].fd = alloc_dmabuf_from_heap(cfg->heap, sizeimage);
         if (bufs[i].fd < 0) {
@@ -169,6 +170,7 @@ int main(int argc, char **argv)
         goto out;
     }
 
+    /* Stream header carries negotiated shape/format for all following frames. */
     net_to_host_hello(&hello, &hello_net);
 
     if (hello.magic != STREAM_MAGIC || hello.version != PROTO_VERSION) {
@@ -212,6 +214,7 @@ int main(int argc, char **argv)
         struct frame_packet pkt;
         uint32_t idx;
 
+        /* Receive one frame packet header first, then payload bytes. */
         if (recv_all(sock, &pkt_net, sizeof(pkt_net)) < 0) {
             fprintf(stderr, "stream closed\n");
             break;
@@ -231,6 +234,7 @@ int main(int argc, char **argv)
 
         idx = pkt.index % hello.buffer_count;
 
+        /* Copy payload into one receiver DMABUF chosen by sender's index. */
         if (recv_all(sock, bufs[idx].addr, pkt.bytesused) < 0) {
             fprintf(stderr, "failed to receive frame payload\n");
             goto out;

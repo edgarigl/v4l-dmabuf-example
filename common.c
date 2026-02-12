@@ -18,6 +18,7 @@ int xioctl(int fd, unsigned long request, void *arg)
 {
     int ret;
 
+    /* Retry interrupted ioctls so callers can treat EINTR as transparent. */
     do {
         ret = ioctl(fd, request, arg);
     } while (ret == -1 && errno == EINTR);
@@ -45,6 +46,10 @@ int alloc_dmabuf_from_heap(const char *heap_path, size_t size)
     };
     int heap_fd;
 
+    /*
+     * Allocate a shareable buffer from dma-heap. In this example the buffer
+     * is mmapped by user space and passed to V4L2 as V4L2_MEMORY_DMABUF.
+     */
     heap_fd = open(heap_path, O_RDWR | O_CLOEXEC);
     if (heap_fd < 0) {
         fprintf(stderr, "failed to open %s: %s\n", heap_path, strerror(errno));
@@ -163,6 +168,7 @@ int send_all(int fd, const void *buf, size_t len)
 {
     const uint8_t *p = buf;
 
+    /* TCP is a stream: one send() may not write the full message. */
     while (len > 0) {
         ssize_t ret = send(fd, p, len, MSG_NOSIGNAL);
 
@@ -187,6 +193,7 @@ int recv_all(int fd, void *buf, size_t len)
 {
     uint8_t *p = buf;
 
+    /* Read exactly len bytes so packet boundaries stay explicit in user space. */
     while (len > 0) {
         ssize_t ret = recv(fd, p, len, 0);
 
@@ -248,6 +255,7 @@ void fourcc_to_text(uint32_t fourcc, char out[5])
 
 void host_to_net_hello(struct stream_hello *dst, const struct stream_hello *src)
 {
+    /* Keep wire format endian-stable across architectures/guests. */
     dst->magic = htonl(src->magic);
     dst->version = htonl(src->version);
     dst->width = htonl(src->width);
@@ -270,6 +278,7 @@ void net_to_host_hello(struct stream_hello *dst, const struct stream_hello *src)
 
 void host_to_net_frame(struct frame_packet *dst, const struct frame_packet *src)
 {
+    /* Frame headers travel over TCP before payload bytes. */
     dst->magic = htonl(src->magic);
     dst->index = htonl(src->index);
     dst->bytesused = htonl(src->bytesused);

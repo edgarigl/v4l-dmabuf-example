@@ -112,6 +112,7 @@ static int parse_args(int argc, char **argv, struct sender_cfg *cfg)
 static int setup_capture_format(int vfd, struct sender_cfg *cfg,
                                 struct v4l2_format *fmt)
 {
+    /* Ask the driver for our preferred format, then keep negotiated values. */
     memset(fmt, 0, sizeof(*fmt));
     fmt->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmt->fmt.pix.width = cfg->width;
@@ -139,6 +140,10 @@ static int request_dmabuf_capture(int vfd, uint32_t count)
         .memory = V4L2_MEMORY_DMABUF,
     };
 
+    /*
+     * Enable DMABUF queueing mode. The application owns the backing memory
+     * and only passes fds to the capture driver.
+     */
     if (xioctl(vfd, VIDIOC_REQBUFS, &req) < 0) {
         fprintf(stderr, "VIDIOC_REQBUFS(DMABUF) failed: %s\n", strerror(errno));
         return -1;
@@ -156,6 +161,7 @@ static int queue_buffer(int vfd, unsigned int index, int dmabuf_fd, uint32_t len
 {
     struct v4l2_buffer buf;
 
+    /* Queue one capture buffer backed by dmabuf_fd. */
     memset(&buf, 0, sizeof(buf));
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_DMABUF;
@@ -178,6 +184,7 @@ static int setup_dmabufs(struct sender_cfg *cfg,
 {
     uint32_t i;
 
+    /* Allocate and map userspace-visible DMABUFs that V4L2 will fill. */
     for (i = 0; i < count; i++) {
         bufs[i].fd = alloc_dmabuf_from_heap(cfg->heap, sizeimage);
         if (bufs[i].fd < 0) {
@@ -259,6 +266,7 @@ int main(int argc, char **argv)
         goto out;
     }
 
+    /* Prime the capture queue with all available buffers before STREAMON. */
     for (i = 0; i < cfg.buffers; i++) {
         if (queue_buffer(vfd, i, bufs[i].fd, fmt.fmt.pix.sizeimage) < 0) {
             goto out;
@@ -278,6 +286,7 @@ int main(int argc, char **argv)
         goto out;
     }
 
+    /* Send one stream header so receiver can size/interpret incoming frames. */
     hello.magic = STREAM_MAGIC;
     hello.version = PROTO_VERSION;
     hello.width = cfg.width;
@@ -309,6 +318,10 @@ int main(int argc, char **argv)
         struct frame_packet pkt_net;
         uint32_t bytesused;
 
+        /*
+         * DQBUF gives us the next completed DMABUF index.
+         * We forward metadata + payload, then re-queue the same DMABUF.
+         */
         memset(&buf, 0, sizeof(buf));
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_DMABUF;

@@ -93,6 +93,7 @@ static int setup_dmabufs(const struct receiver_cfg *cfg,
         return -1;
     }
 
+    /* Same data path as receiver.c: maintain local DMABUF backing storage. */
     for (i = 0; i < count; i++) {
         bufs[i].fd = alloc_dmabuf_from_heap(cfg->heap, sizeimage);
         if (bufs[i].fd < 0) {
@@ -145,6 +146,10 @@ static void cleanup_dmabufs(struct buffer_ctx *bufs, uint32_t count)
 
 static int map_fourcc_to_sdl(uint32_t fourcc, uint32_t *sdl_fmt, int *pitch, uint32_t width)
 {
+    /*
+     * Map V4L2 packed-YUV formats to SDL texture formats. We keep this narrow
+     * for clarity; unsupported formats fail fast with a clear error.
+     */
     switch (fourcc) {
     case V4L2_PIX_FMT_YUYV:
         *sdl_fmt = SDL_PIXELFORMAT_YUY2;
@@ -176,6 +181,7 @@ static int display_init(struct display_ctx *disp, const struct stream_hello *hel
         return -1;
     }
 
+    /* Create window/renderer/texture once, then update texture per frame. */
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return -1;
@@ -231,6 +237,7 @@ static void display_destroy(struct display_ctx *disp)
 
 static int display_frame(struct display_ctx *disp, const void *data)
 {
+    /* Upload one full frame from mapped DMABUF memory and present it. */
     if (SDL_UpdateTexture(disp->texture, NULL, data, disp->pitch) != 0) {
         fprintf(stderr, "SDL_UpdateTexture failed: %s\n", SDL_GetError());
         return -1;
@@ -278,6 +285,7 @@ int main(int argc, char **argv)
         goto out;
     }
 
+    /* Parse sender stream description before creating SDL objects. */
     net_to_host_hello(&hello, &hello_net);
 
     if (hello.magic != STREAM_MAGIC || hello.version != PROTO_VERSION) {
@@ -318,6 +326,7 @@ int main(int argc, char **argv)
         uint32_t idx;
         SDL_Event ev;
 
+        /* Keep window responsive while waiting for network frames. */
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) {
                 rc = 0;
@@ -344,6 +353,7 @@ int main(int argc, char **argv)
 
         idx = pkt.index % hello.buffer_count;
 
+        /* Receive payload into DMABUF mapping, then draw it via SDL. */
         if (recv_all(sock, bufs[idx].addr, pkt.bytesused) < 0) {
             fprintf(stderr, "failed to receive frame payload\n");
             goto out;
