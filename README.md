@@ -30,10 +30,11 @@ DMABUF-backed buffers at both ends.
 make
 ```
 
-Builds two binaries:
+Builds binaries:
 
 - `sender`
 - `receiver`
+- `receiver_sdl` (only if `sdl2` development package is available)
 
 ## Usage
 
@@ -49,6 +50,20 @@ Options:
 - `-p <port>` listen port (required)
 - `-e <heap>` DMA heap (default `/dev/dma_heap/system`)
 - `-o <path>` optional output raw dump
+
+### 1b. Start live SDL receiver on Guest B (optional)
+
+```bash
+./receiver_sdl -p 9000
+```
+
+Options:
+
+- `-l <ip>` listen address (default `0.0.0.0`)
+- `-p <port>` listen port (required)
+- `-e <heap>` DMA heap (default `/dev/dma_heap/system`)
+
+Supported live display formats in `receiver_sdl`: `YUYV`, `UYVY`, `YVYU`.
 
 ### 2. Start sender on Guest A
 
@@ -84,3 +99,13 @@ This example demonstrates user space behavior only. It does not require private
 virtio-media ioctls and does not move grant references. It is useful as a
 baseline for comparing capture path behavior across KVM/Xen and for validating
 that the application-level transport logic is sound.
+
+## SDL/DRM and virtio-gpu
+
+`receiver_sdl` can exercise `virtio-gpu` in the receiver guest, but it depends
+on SDL backend selection:
+
+- `SDL_VIDEODRIVER=kmsdrm` uses DRM/KMS directly and hits the guest DRM device
+  (typically `virtio-gpu` when that is your virtual GPU).
+- `SDL_VIDEODRIVER=x11` or `wayland` goes through a compositor/display server;
+  this is usually indirect from the app point of view.
