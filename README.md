@@ -82,6 +82,10 @@ Options:
 - `-b <count>` DMABUF count (default `4`)
 - `-n <frames>` stop after N frames (default unlimited)
 - `-e <heap>` DMA heap (default `/dev/dma_heap/system`)
+- `-m <mode>` capture memory mode: `auto` (default), `dmabuf`, `mmap`
+
+`auto` first tries `V4L2_MEMORY_DMABUF` and falls back to `V4L2_MEMORY_MMAP`
+if the driver rejects DMABUF `REQBUFS`.
 
 ## Quick validation
 
@@ -99,6 +103,16 @@ This example demonstrates user space behavior only. It does not require private
 virtio-media ioctls and does not move grant references. It is useful as a
 baseline for comparing capture path behavior across KVM/Xen and for validating
 that the application-level transport logic is sound.
+
+If your capture node fails with:
+
+- `VIDIOC_REQBUFS(DMABUF) failed: Invalid argument`
+
+run sender in fallback mode:
+
+```bash
+./sender -d /dev/video0 -a <receiver-ip> -p 9000 -m mmap
+```
 
 ## SDL/DRM and virtio-gpu
 

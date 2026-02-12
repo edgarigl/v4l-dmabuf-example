@@ -14,6 +14,12 @@
 #include <time.h>
 #include <unistd.h>
 
+enum sender_mem_mode {
+    SENDER_MEM_AUTO,
+    SENDER_MEM_DMABUF,
+    SENDER_MEM_MMAP,
+};
+
 struct buffer_ctx {
     int fd;
     void *addr;
@@ -30,7 +36,50 @@ struct sender_cfg {
     uint32_t pixelformat;
     uint32_t buffers;
     int frame_limit;
+    enum sender_mem_mode mem_mode;
 };
+
+static const char *sender_mem_mode_name(enum sender_mem_mode mode)
+{
+    switch (mode) {
+    case SENDER_MEM_AUTO:
+        return "auto";
+    case SENDER_MEM_DMABUF:
+        return "dmabuf";
+    case SENDER_MEM_MMAP:
+        return "mmap";
+    default:
+        return "unknown";
+    }
+}
+
+static const char *v4l2_mem_name(enum v4l2_memory mem)
+{
+    switch (mem) {
+    case V4L2_MEMORY_DMABUF:
+        return "dmabuf";
+    case V4L2_MEMORY_MMAP:
+        return "mmap";
+    default:
+        return "unknown";
+    }
+}
+
+static enum sender_mem_mode parse_mem_mode_or_die(const char *s)
+{
+    if (strcmp(s, "auto") == 0) {
+        return SENDER_MEM_AUTO;
+    }
+    if (strcmp(s, "dmabuf") == 0) {
+        return SENDER_MEM_DMABUF;
+    }
+    if (strcmp(s, "mmap") == 0) {
+        return SENDER_MEM_MMAP;
+    }
+
+    fprintf(stderr, "invalid -m mode: %s (expected auto|dmabuf|mmap)\n", s);
+    exit(1);
+}
 
 static void usage(const char *prog)
 {
@@ -45,7 +94,8 @@ static void usage(const char *prog)
             "  -f <fourcc>   Pixel format (default YUYV)\n"
             "  -b <count>    Buffer count (default 4)\n"
             "  -n <frames>   Stop after N frames (default: unlimited)\n"
-            "  -e <heap>     dma-heap device (default /dev/dma_heap/system)\n",
+            "  -e <heap>     dma-heap device (default /dev/dma_heap/system)\n"
+            "  -m <mode>     capture memory mode: auto|dmabuf|mmap (default auto)\n",
             prog);
 }
 
@@ -63,9 +113,10 @@ static int parse_args(int argc, char **argv, struct sender_cfg *cfg)
         .pixelformat = v4l2_fourcc('Y', 'U', 'Y', 'V'),
         .buffers = 4,
         .frame_limit = -1,
+        .mem_mode = SENDER_MEM_AUTO,
     };
 
-    while ((c = getopt(argc, argv, "d:a:p:W:H:f:b:n:e:h")) != -1) {
+    while ((c = getopt(argc, argv, "d:a:p:W:H:f:b:n:e:m:h")) != -1) {
         switch (c) {
         case 'd':
             cfg->device = optarg;
@@ -93,6 +144,9 @@ static int parse_args(int argc, char **argv, struct sender_cfg *cfg)
             break;
         case 'e':
             cfg->heap = optarg;
+            break;
+        case 'm':
+            cfg->mem_mode = parse_mem_mode_or_die(optarg);
             break;
         case 'h':
         default:
@@ -132,45 +186,50 @@ static int setup_capture_format(int vfd, struct sender_cfg *cfg,
     return 0;
 }
 
-static int request_dmabuf_capture(int vfd, uint32_t count)
+static int request_capture_buffers(int vfd, uint32_t *count, enum v4l2_memory memory)
 {
     struct v4l2_requestbuffers req = {
-        .count = count,
+        .count = *count,
         .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-        .memory = V4L2_MEMORY_DMABUF,
+        .memory = memory,
     };
 
-    /*
-     * Enable DMABUF queueing mode. The application owns the backing memory
-     * and only passes fds to the capture driver.
-     */
     if (xioctl(vfd, VIDIOC_REQBUFS, &req) < 0) {
-        fprintf(stderr, "VIDIOC_REQBUFS(DMABUF) failed: %s\n", strerror(errno));
         return -1;
     }
 
-    if (req.count < count) {
-        fprintf(stderr, "requested %u buffers, got %u\n", count, req.count);
+    if (req.count == 0) {
+        errno = ENOMEM;
         return -1;
     }
 
+    *count = req.count;
     return 0;
 }
 
-static int queue_buffer(int vfd, unsigned int index, int dmabuf_fd, uint32_t len)
+static int queue_buffer(int vfd, unsigned int index, const struct buffer_ctx *b,
+                        enum v4l2_memory memory)
 {
     struct v4l2_buffer buf;
 
-    /* Queue one capture buffer backed by dmabuf_fd. */
     memset(&buf, 0, sizeof(buf));
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_DMABUF;
+    buf.memory = memory;
     buf.index = index;
-    buf.m.fd = dmabuf_fd;
-    buf.length = len;
+    buf.length = (uint32_t)b->len;
+
+    if (memory == V4L2_MEMORY_DMABUF) {
+        if (b->fd < 0) {
+            fprintf(stderr, "buffer %u has no dmabuf fd\n", index);
+            errno = EINVAL;
+            return -1;
+        }
+        buf.m.fd = b->fd;
+    }
 
     if (xioctl(vfd, VIDIOC_QBUF, &buf) < 0) {
-        fprintf(stderr, "VIDIOC_QBUF(index=%u) failed: %s\n", index, strerror(errno));
+        fprintf(stderr, "VIDIOC_QBUF(index=%u, mem=%s) failed: %s\n",
+                index, v4l2_mem_name(memory), strerror(errno));
         return -1;
     }
 
@@ -203,7 +262,53 @@ static int setup_dmabufs(struct sender_cfg *cfg,
     return 0;
 }
 
-static void cleanup_dmabufs(struct buffer_ctx *bufs, uint32_t count)
+static int setup_mmap_buffers(int vfd, struct buffer_ctx *bufs, uint32_t count)
+{
+    uint32_t i;
+
+    /*
+     * MMAP mode is a compatibility fallback for drivers that reject
+     * V4L2_MEMORY_DMABUF in REQBUFS. We still try EXPBUF to expose DMABUF fds.
+     */
+    for (i = 0; i < count; i++) {
+        struct v4l2_buffer qbuf;
+        struct v4l2_exportbuffer expbuf;
+
+        memset(&qbuf, 0, sizeof(qbuf));
+        qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        qbuf.memory = V4L2_MEMORY_MMAP;
+        qbuf.index = i;
+
+        if (xioctl(vfd, VIDIOC_QUERYBUF, &qbuf) < 0) {
+            fprintf(stderr, "VIDIOC_QUERYBUF(index=%u) failed: %s\n", i, strerror(errno));
+            return -1;
+        }
+
+        bufs[i].len = qbuf.length;
+        bufs[i].addr = mmap(NULL, qbuf.length, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, vfd, qbuf.m.offset);
+        if (bufs[i].addr == MAP_FAILED) {
+            fprintf(stderr, "mmap(v4l2 idx=%u) failed: %s\n", i, strerror(errno));
+            bufs[i].addr = NULL;
+            return -1;
+        }
+
+        memset(&expbuf, 0, sizeof(expbuf));
+        expbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        expbuf.index = i;
+        expbuf.flags = O_CLOEXEC | O_RDWR;
+
+        if (xioctl(vfd, VIDIOC_EXPBUF, &expbuf) == 0) {
+            bufs[i].fd = expbuf.fd;
+        } else {
+            bufs[i].fd = -1;
+        }
+    }
+
+    return 0;
+}
+
+static void cleanup_buffers(struct buffer_ctx *bufs, uint32_t count)
 {
     uint32_t i;
 
@@ -231,10 +336,14 @@ int main(int argc, char **argv)
     struct timeval start_tv = {0};
     struct timeval now_tv;
     uint64_t frames = 0;
+    uint32_t requested;
+    uint32_t i;
+    uint32_t exported = 0;
+    enum v4l2_memory mem = V4L2_MEMORY_DMABUF;
+    bool tried_dmabuf = false;
     int vfd = -1;
     int sock = -1;
     int rc = 1;
-    uint32_t i;
 
     if (parse_args(argc, argv, &cfg) < 0) {
         return 1;
@@ -249,8 +358,33 @@ int main(int argc, char **argv)
         goto out;
     }
 
-    if (request_dmabuf_capture(vfd, cfg.buffers) < 0) {
-        goto out;
+    requested = cfg.buffers;
+
+    if (cfg.mem_mode != SENDER_MEM_MMAP) {
+        tried_dmabuf = true;
+        if (request_capture_buffers(vfd, &requested, V4L2_MEMORY_DMABUF) == 0) {
+            mem = V4L2_MEMORY_DMABUF;
+            cfg.buffers = requested;
+        } else if (cfg.mem_mode == SENDER_MEM_DMABUF) {
+            fprintf(stderr, "VIDIOC_REQBUFS(DMABUF) failed: %s\n", strerror(errno));
+            goto out;
+        }
+    }
+
+    if ((cfg.mem_mode == SENDER_MEM_MMAP) ||
+        (tried_dmabuf && mem != V4L2_MEMORY_DMABUF)) {
+        if (cfg.mem_mode == SENDER_MEM_AUTO) {
+            fprintf(stderr,
+                    "VIDIOC_REQBUFS(DMABUF) not supported, falling back to MMAP path\n");
+        }
+
+        requested = cfg.buffers;
+        if (request_capture_buffers(vfd, &requested, V4L2_MEMORY_MMAP) < 0) {
+            fprintf(stderr, "VIDIOC_REQBUFS(MMAP) failed: %s\n", strerror(errno));
+            goto out;
+        }
+        mem = V4L2_MEMORY_MMAP;
+        cfg.buffers = requested;
     }
 
     bufs = calloc(cfg.buffers, sizeof(*bufs));
@@ -258,17 +392,29 @@ int main(int argc, char **argv)
         fprintf(stderr, "calloc buffers failed\n");
         goto out;
     }
+
     for (i = 0; i < cfg.buffers; i++) {
         bufs[i].fd = -1;
     }
 
-    if (setup_dmabufs(&cfg, bufs, cfg.buffers, fmt.fmt.pix.sizeimage) < 0) {
-        goto out;
+    if (mem == V4L2_MEMORY_DMABUF) {
+        if (setup_dmabufs(&cfg, bufs, cfg.buffers, fmt.fmt.pix.sizeimage) < 0) {
+            goto out;
+        }
+    } else {
+        if (setup_mmap_buffers(vfd, bufs, cfg.buffers) < 0) {
+            goto out;
+        }
+        for (i = 0; i < cfg.buffers; i++) {
+            if (bufs[i].fd >= 0) {
+                exported++;
+            }
+        }
     }
 
     /* Prime the capture queue with all available buffers before STREAMON. */
     for (i = 0; i < cfg.buffers; i++) {
-        if (queue_buffer(vfd, i, bufs[i].fd, fmt.fmt.pix.sizeimage) < 0) {
+        if (queue_buffer(vfd, i, &bufs[i], mem) < 0) {
             goto out;
         }
     }
@@ -305,9 +451,14 @@ int main(int argc, char **argv)
         char fourcc[5];
         fourcc_to_text(cfg.pixelformat, fourcc);
         fprintf(stderr,
-                "capturing %ux%u %s, sizeimage=%u, buffers=%u -> %s:%u\n",
+                "capturing %ux%u %s, sizeimage=%u, buffers=%u -> %s:%u (mode=%s, request=%s)\n",
                 cfg.width, cfg.height, fourcc, fmt.fmt.pix.sizeimage,
-                cfg.buffers, cfg.peer_ip, cfg.port);
+                cfg.buffers, cfg.peer_ip, cfg.port, v4l2_mem_name(mem),
+                sender_mem_mode_name(cfg.mem_mode));
+        if (mem == V4L2_MEMORY_MMAP) {
+            fprintf(stderr, "mmap fallback: exported %u/%u buffers as dmabuf fds\n",
+                    exported, cfg.buffers);
+        }
     }
 
     gettimeofday(&start_tv, NULL);
@@ -319,15 +470,16 @@ int main(int argc, char **argv)
         uint32_t bytesused;
 
         /*
-         * DQBUF gives us the next completed DMABUF index.
-         * We forward metadata + payload, then re-queue the same DMABUF.
+         * DQBUF gives us the next completed buffer index.
+         * We forward metadata + payload, then re-queue the same buffer.
          */
         memset(&buf, 0, sizeof(buf));
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_DMABUF;
+        buf.memory = mem;
 
         if (xioctl(vfd, VIDIOC_DQBUF, &buf) < 0) {
-            fprintf(stderr, "VIDIOC_DQBUF failed: %s\n", strerror(errno));
+            fprintf(stderr, "VIDIOC_DQBUF(mem=%s) failed: %s\n",
+                    v4l2_mem_name(mem), strerror(errno));
             goto out;
         }
         if (buf.index >= cfg.buffers) {
@@ -358,7 +510,7 @@ int main(int argc, char **argv)
             goto out;
         }
 
-        if (queue_buffer(vfd, buf.index, bufs[buf.index].fd, fmt.fmt.pix.sizeimage) < 0) {
+        if (queue_buffer(vfd, buf.index, &bufs[buf.index], mem) < 0) {
             goto out;
         }
 
@@ -382,7 +534,7 @@ out:
     if (sock >= 0) {
         close(sock);
     }
-    cleanup_dmabufs(bufs, cfg.buffers);
+    cleanup_buffers(bufs, cfg.buffers);
     free(bufs);
     if (vfd >= 0) {
         close(vfd);
