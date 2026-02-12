@@ -9,7 +9,7 @@
  * Keep this header local so the example can be built standalone.
  */
 
-#define VIRTIO_MEDIA_MAX_IMPORT_GREFS 512
+#define VIRTIO_MEDIA_MAX_IMPORT_GREFS 4000
 
 struct virtio_media_ioc_export_buffer {
     __u32 queue_type;
