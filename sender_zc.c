@@ -22,9 +22,12 @@ struct capture_buffer {
     void *addr;
     size_t len;
     uint32_t offset;
-    /* Handle metadata is created lazily on first frame for this queue index. */
+    /* Exported handle for this MMAP queue slot. */
     bool exported;
     uint64_t handle_id;
+    /* Import metadata (grant refs) fetched once and sent to peer guest. */
+    bool share_meta_ready;
+    struct virtio_media_ioc_import_buffer imp;
 };
 
 struct sender_cfg {
@@ -344,6 +347,79 @@ static int export_handle_for_buffer(int vfd, uint32_t queue_type,
     return 0;
 }
 
+static int fetch_share_metadata(int vfd, struct capture_buffer *b)
+{
+    struct virtio_media_ioc_import_buffer imp;
+
+    memset(&imp, 0, sizeof(imp));
+    imp.handle_id = b->handle_id;
+    imp.dmabuf_fd = -1;
+
+    /*
+     * Resolve our exported handle through the local backend to retrieve Xen
+     * grant refs. Those refs are what the peer guest imports directly.
+     */
+    if (xioctl(vfd, VIDIOC_VIRTIO_MEDIA_IMPORT_BUFFER, &imp) < 0) {
+        fprintf(stderr,
+                "VIDIOC_VIRTIO_MEDIA_IMPORT_BUFFER(handle=%" PRIu64 ") failed: %s\n",
+                b->handle_id, strerror(errno));
+        return -1;
+    }
+
+    if (!imp.gref_count || imp.gref_count > VIRTIO_MEDIA_MAX_IMPORT_GREFS ||
+        imp.gref_page_size == 0 || imp.len == 0) {
+        fprintf(stderr,
+                "invalid share metadata for handle=%" PRIu64
+                " (grefs=%u page=%u len=%" PRIu64 ")\n",
+                b->handle_id, imp.gref_count, imp.gref_page_size,
+                (uint64_t)imp.len);
+        if (imp.dmabuf_fd >= 0) {
+            close(imp.dmabuf_fd);
+        }
+        return -1;
+    }
+
+    if (imp.dmabuf_fd >= 0) {
+        close(imp.dmabuf_fd);
+        imp.dmabuf_fd = -1;
+    }
+
+    b->imp = imp;
+    b->share_meta_ready = true;
+    return 0;
+}
+
+static int send_handle_packet(int sock, const struct capture_buffer *b)
+{
+    struct zc_handle_packet hp;
+    struct zc_handle_packet hp_net;
+    uint32_t i;
+
+    if (!b->share_meta_ready) {
+        return -1;
+    }
+
+    memset(&hp, 0, sizeof(hp));
+    hp.magic = ZC_HANDLE_MAGIC;
+    hp.flags = VIRTIO_MEDIA_IMPORT_F_DIRECT_GREFS;
+    hp.handle_id = b->handle_id;
+    hp.len = b->imp.len;
+    hp.gref_count = b->imp.gref_count;
+    hp.gref_page_size = b->imp.gref_page_size;
+    hp.gref_domid = b->imp.gref_domid;
+    for (i = 0; i < b->imp.gref_count; i++) {
+        hp.gref_ids[i] = b->imp.gref_ids[i];
+    }
+
+    host_to_net_zc_handle(&hp_net, &hp);
+    if (send_all(sock, &hp_net, sizeof(hp_net)) < 0) {
+        fprintf(stderr, "failed to send handle metadata packet\n");
+        return -1;
+    }
+
+    return 0;
+}
+
 static void release_exported_handles(int vfd, const struct capture_buffer *bufs, uint32_t count)
 {
     uint32_t i;
@@ -405,6 +481,11 @@ int main(int argc, char **argv)
                     "export failed before STREAMON; cannot continue zero-copy mode\n");
             goto out;
         }
+        if (fetch_share_metadata(vfd, &bufs[i]) < 0) {
+            fprintf(stderr,
+                    "failed to fetch share metadata for buffer %u\n", i);
+            goto out;
+        }
     }
 
     /* Queue all capture buffers before STREAMON to start a steady pipeline. */
@@ -455,6 +536,16 @@ int main(int argc, char **argv)
     if (send_all(sock, &hello_net, sizeof(hello_net)) < 0) {
         fprintf(stderr, "failed to send stream header\n");
         goto out;
+    }
+
+    /*
+     * Send per-buffer grant metadata up front so the receiver can import all
+     * handles before frame traffic starts.
+     */
+    for (i = 0; i < cfg.buffers; i++) {
+        if (send_handle_packet(sock, &bufs[i]) < 0) {
+            goto out;
+        }
     }
 
     fprintf(stderr,

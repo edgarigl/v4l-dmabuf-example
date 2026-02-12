@@ -92,8 +92,12 @@ Adjust format/size to match sender settings.
 
 - Guest A captures with `V4L2_MEMORY_MMAP`.
 - Guest A exports queue buffers via private virtio-media ioctl (`VIDIOC_VIRTIO_MEDIA_EXPORT_BUFFER`).
-- Sender transmits only metadata + `handle_id` over TCP.
-- Guest B imports handles via private virtio-media ioctl (`VIDIOC_VIRTIO_MEDIA_IMPORT_BUFFER`).
+- Sender resolves exported handles into Xen grant metadata and sends one setup
+  control packet per handle over TCP.
+- Guest B imports with private ioctl `VIDIOC_VIRTIO_MEDIA_IMPORT_BUFFER` using
+  direct-gref mode (`VIRTIO_MEDIA_IMPORT_F_DIRECT_GREFS`), so it does not rely
+  on local QEMU handle lookup.
+- Per-frame packets then carry only metadata + `handle_id` over TCP.
 - Guest B maps imported DMABUFs and reads frames directly from shared memory.
 
 No frame payload bytes are sent over TCP in this flow.
@@ -103,6 +107,7 @@ No frame payload bytes are sent over TCP in this flow.
 - Out-of-tree virtio-media driver/QEMU implementation with export/import support.
 - Private ioctls from `virtio_media_uapi.h` available in the running guest driver.
 - Both guests connected to compatible virtio-media backend setup.
+- Sender and receiver binaries from the same `PROTO_VERSION`.
 
 ### Receiver (Guest B)
 

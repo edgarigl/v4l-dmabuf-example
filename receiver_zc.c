@@ -19,6 +19,7 @@ struct import_entry {
     int dmabuf_fd;
     void *addr;
     size_t len;
+    bool needs_release;
 };
 
 struct receiver_cfg {
@@ -101,20 +102,30 @@ static struct import_entry *find_entry(struct import_entry *entries,
     return NULL;
 }
 
-static int import_handle(int vfd, uint64_t handle_id, struct import_entry *entry)
+static int import_handle_direct(int vfd, const struct zc_handle_packet *hp,
+                                struct import_entry *entry)
 {
     struct virtio_media_ioc_import_buffer imp;
+    uint32_t i;
 
     memset(&imp, 0, sizeof(imp));
-    imp.handle_id = handle_id;
+    imp.handle_id = hp->handle_id;
+    imp.flags = VIRTIO_MEDIA_IMPORT_F_DIRECT_GREFS;
+    imp.gref_count = hp->gref_count;
+    imp.gref_page_size = hp->gref_page_size;
+    imp.gref_domid = hp->gref_domid;
+    imp.len = hp->len;
+    for (i = 0; i < hp->gref_count && i < VIRTIO_MEDIA_MAX_IMPORT_GREFS; i++) {
+        imp.gref_ids[i] = hp->gref_ids[i];
+    }
 
     /*
-     * Driver-private import ioctl: resolves a remote handle into a local
-     * dmabuf fd backed by shared pages.
+     * Direct-gref import avoids local QEMU handle lookup. This is required
+     * when sender and receiver are different guests (different QEMU instances).
      */
     if (xioctl(vfd, VIDIOC_VIRTIO_MEDIA_IMPORT_BUFFER, &imp) < 0) {
         fprintf(stderr, "VIDIOC_VIRTIO_MEDIA_IMPORT_BUFFER(handle=%" PRIu64 ") failed: %s\n",
-                handle_id, strerror(errno));
+                hp->handle_id, strerror(errno));
         return -1;
     }
 
@@ -136,29 +147,22 @@ static int import_handle(int vfd, uint64_t handle_id, struct import_entry *entry
         return -1;
     }
 
-    entry->handle_id = handle_id;
+    entry->handle_id = hp->handle_id;
     entry->dmabuf_fd = imp.dmabuf_fd;
     entry->len = (size_t)imp.len;
+    entry->needs_release = false;
 
     return 0;
 }
 
-static int ensure_entry(int vfd,
-                        struct import_entry **entries,
+static int append_entry(struct import_entry **entries,
                         size_t *count,
                         size_t *capacity,
-                        uint64_t handle_id,
                         struct import_entry **out)
 {
     struct import_entry *entry;
 
-    entry = find_entry(*entries, *count, handle_id);
-    if (entry) {
-        *out = entry;
-        return 0;
-    }
-
-    /* Grow a tiny cache so repeated frames don't re-import the same handle. */
+    /* Grow a tiny cache so we can import all announced handles up front. */
     if (*count == *capacity) {
         size_t new_cap = (*capacity == 0) ? 8 : (*capacity * 2);
         struct import_entry *new_entries = realloc(*entries,
@@ -173,11 +177,6 @@ static int ensure_entry(int vfd,
     entry = &(*entries)[*count];
     memset(entry, 0, sizeof(*entry));
     entry->dmabuf_fd = -1;
-    if (import_handle(vfd, handle_id, entry) < 0) {
-        return -1;
-    }
-
-    *count += 1;
     *out = entry;
     return 0;
 }
@@ -200,9 +199,11 @@ static void cleanup_entries(int vfd, struct import_entry *entries, size_t count)
             close(entries[i].dmabuf_fd);
         }
 
-        memset(&rel, 0, sizeof(rel));
-        rel.handle_id = entries[i].handle_id;
-        xioctl(vfd, VIDIOC_VIRTIO_MEDIA_RELEASE_HANDLE, &rel);
+        if (entries[i].needs_release) {
+            memset(&rel, 0, sizeof(rel));
+            rel.handle_id = entries[i].handle_id;
+            xioctl(vfd, VIDIOC_VIRTIO_MEDIA_RELEASE_HANDLE, &rel);
+        }
     }
 
     free(entries);
@@ -250,6 +251,52 @@ int main(int argc, char **argv)
         goto out;
     }
 
+    /*
+     * Import all shared handles advertised by the sender before reading frame
+     * packets. This gives deterministic failure points and avoids per-frame
+     * control path stalls.
+     */
+    {
+        uint32_t i;
+
+        for (i = 0; i < hello.buffer_count; i++) {
+            struct zc_handle_packet hp_net;
+            struct zc_handle_packet hp;
+            struct import_entry *entry;
+
+            if (recv_all(sock, &hp_net, sizeof(hp_net)) < 0) {
+                fprintf(stderr, "failed to receive handle metadata packet\n");
+                goto out;
+            }
+            net_to_host_zc_handle(&hp, &hp_net);
+
+            if (hp.magic != ZC_HANDLE_MAGIC ||
+                !(hp.flags & VIRTIO_MEDIA_IMPORT_F_DIRECT_GREFS) ||
+                hp.gref_count == 0 ||
+                hp.gref_count > VIRTIO_MEDIA_MAX_IMPORT_GREFS ||
+                hp.gref_page_size == 0 || hp.len == 0) {
+                fprintf(stderr,
+                        "invalid handle packet magic=0x%x flags=0x%x grefs=%u len=%" PRIu64 "\n",
+                        hp.magic, hp.flags, hp.gref_count, (uint64_t)hp.len);
+                goto out;
+            }
+
+            if (find_entry(entries, entry_count, hp.handle_id)) {
+                fprintf(stderr, "duplicate handle metadata for %" PRIu64 "\n",
+                        hp.handle_id);
+                goto out;
+            }
+
+            if (append_entry(&entries, &entry_count, &entry_capacity, &entry) < 0) {
+                goto out;
+            }
+            if (import_handle_direct(vfd, &hp, entry) < 0) {
+                goto out;
+            }
+            entry_count += 1;
+        }
+    }
+
     if (cfg.output_path) {
         out_fd = open(cfg.output_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
         if (out_fd < 0) {
@@ -289,8 +336,10 @@ int main(int argc, char **argv)
             goto out;
         }
 
-        if (ensure_entry(vfd, &entries, &entry_count, &entry_capacity,
-                         pkt.handle_id, &entry) < 0) {
+        entry = find_entry(entries, entry_count, pkt.handle_id);
+        if (!entry) {
+            fprintf(stderr, "unknown handle in frame packet: %" PRIu64 "\n",
+                    pkt.handle_id);
             goto out;
         }
 

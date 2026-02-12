@@ -36,6 +36,8 @@ struct virtio_media_ioc_import_buffer {
     __u32 gref_ids[VIRTIO_MEDIA_MAX_IMPORT_GREFS];
 };
 
+#define VIRTIO_MEDIA_IMPORT_F_DIRECT_GREFS (1U << 0)
+
 struct virtio_media_ioc_release_handle {
     __u64 handle_id;
 };

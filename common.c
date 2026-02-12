@@ -340,3 +340,37 @@ void net_to_host_zc_ack(struct zc_ack_packet *dst, const struct zc_ack_packet *s
     dst->handle_id = ntohll_u64(src->handle_id);
     dst->sequence = ntohll_u64(src->sequence);
 }
+
+void host_to_net_zc_handle(struct zc_handle_packet *dst, const struct zc_handle_packet *src)
+{
+    uint32_t i;
+
+    dst->magic = htonl(src->magic);
+    dst->flags = htonl(src->flags);
+    dst->handle_id = htonll_u64(src->handle_id);
+    dst->len = htonll_u64(src->len);
+    dst->gref_count = htonl(src->gref_count);
+    dst->gref_page_size = htonl(src->gref_page_size);
+    dst->gref_domid = htonl(src->gref_domid);
+    dst->__reserved = htonl(src->__reserved);
+    for (i = 0; i < VIRTIO_MEDIA_MAX_IMPORT_GREFS; i++) {
+        dst->gref_ids[i] = htonl(src->gref_ids[i]);
+    }
+}
+
+void net_to_host_zc_handle(struct zc_handle_packet *dst, const struct zc_handle_packet *src)
+{
+    uint32_t i;
+
+    dst->magic = ntohl(src->magic);
+    dst->flags = ntohl(src->flags);
+    dst->handle_id = ntohll_u64(src->handle_id);
+    dst->len = ntohll_u64(src->len);
+    dst->gref_count = ntohl(src->gref_count);
+    dst->gref_page_size = ntohl(src->gref_page_size);
+    dst->gref_domid = ntohl(src->gref_domid);
+    dst->__reserved = ntohl(src->__reserved);
+    for (i = 0; i < VIRTIO_MEDIA_MAX_IMPORT_GREFS; i++) {
+        dst->gref_ids[i] = ntohl(src->gref_ids[i]);
+    }
+}
