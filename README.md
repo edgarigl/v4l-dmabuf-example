@@ -150,6 +150,7 @@ Options:
 - `-n <frames>` stop after N frames (default unlimited)
 - `-k <ms>` ACK wait timeout in ms (default `200`)
 - `-t <ms>` TCP connect timeout in ms (default `3000`)
+- `-D <domid>` receiver guest Xen domid (required for cross-guest grants)
 
 ### Synchronization model
 

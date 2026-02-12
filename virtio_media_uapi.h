@@ -37,6 +37,9 @@ struct virtio_media_ioc_import_buffer {
 };
 
 #define VIRTIO_MEDIA_IMPORT_F_DIRECT_GREFS (1U << 0)
+#define VIRTIO_MEDIA_IMPORT_F_TARGET_DOMID (1U << 1)
+#define VIRTIO_MEDIA_IMPORT_DOMID_SHIFT 16
+#define VIRTIO_MEDIA_IMPORT_DOMID_MASK 0xffffU
 
 struct virtio_media_ioc_release_handle {
     __u64 handle_id;

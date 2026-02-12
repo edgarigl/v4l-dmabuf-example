@@ -41,6 +41,7 @@ struct sender_cfg {
     int frame_limit;
     int ack_timeout_ms;
     int connect_timeout_ms;
+    uint32_t peer_domid;
 };
 
 static void usage(const char *prog)
@@ -57,7 +58,8 @@ static void usage(const char *prog)
             "  -b <count>    Buffer count (default 4)\n"
             "  -n <frames>   Stop after N frames (default: unlimited)\n"
             "  -k <ms>       ACK wait timeout in milliseconds (default 200)\n"
-            "  -t <ms>       TCP connect timeout in milliseconds (default 3000)\n",
+            "  -t <ms>       TCP connect timeout in milliseconds (default 3000)\n"
+            "  -D <domid>    Peer Xen domid for grant export (required for cross-guest)\n",
             prog);
 }
 
@@ -144,9 +146,10 @@ static int parse_args(int argc, char **argv, struct sender_cfg *cfg)
         .frame_limit = -1,
         .ack_timeout_ms = 200,
         .connect_timeout_ms = 3000,
+        .peer_domid = 0,
     };
 
-    while ((c = getopt(argc, argv, "d:a:p:W:H:f:b:n:k:t:h")) != -1) {
+    while ((c = getopt(argc, argv, "d:a:p:W:H:f:b:n:k:t:D:h")) != -1) {
         switch (c) {
         case 'd':
             cfg->device = optarg;
@@ -186,6 +189,9 @@ static int parse_args(int argc, char **argv, struct sender_cfg *cfg)
                 return -1;
             }
             break;
+        case 'D':
+            cfg->peer_domid = (uint32_t)strtoul(optarg, NULL, 10);
+            break;
         case 'h':
         default:
             usage(argv[0]);
@@ -195,6 +201,10 @@ static int parse_args(int argc, char **argv, struct sender_cfg *cfg)
 
     if (!cfg->peer_ip || cfg->port == 0 || cfg->buffers == 0) {
         usage(argv[0]);
+        return -1;
+    }
+    if (cfg->peer_domid == 0) {
+        fprintf(stderr, "peer domid must be set with -D for cross-guest zero-copy\n");
         return -1;
     }
 
@@ -347,12 +357,14 @@ static int export_handle_for_buffer(int vfd, uint32_t queue_type,
     return 0;
 }
 
-static int fetch_share_metadata(int vfd, struct capture_buffer *b)
+static int fetch_share_metadata(int vfd, struct capture_buffer *b, uint32_t peer_domid)
 {
     struct virtio_media_ioc_import_buffer imp;
 
     memset(&imp, 0, sizeof(imp));
     imp.handle_id = b->handle_id;
+    imp.flags = VIRTIO_MEDIA_IMPORT_F_TARGET_DOMID;
+    imp.gref_domid = peer_domid;
     imp.dmabuf_fd = -1;
 
     /*
@@ -481,7 +493,7 @@ int main(int argc, char **argv)
                     "export failed before STREAMON; cannot continue zero-copy mode\n");
             goto out;
         }
-        if (fetch_share_metadata(vfd, &bufs[i]) < 0) {
+        if (fetch_share_metadata(vfd, &bufs[i], cfg.peer_domid) < 0) {
             fprintf(stderr,
                     "failed to fetch share metadata for buffer %u\n", i);
             goto out;
@@ -549,9 +561,10 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr,
-            "zero-copy sender: %s -> %s:%u (%ux%u buffers=%u ack_timeout=%dms)\n",
+            "zero-copy sender: %s -> %s:%u (%ux%u buffers=%u ack_timeout=%dms peer_domid=%u)\n",
             cfg.device, cfg.peer_ip, cfg.port,
-            cfg.width, cfg.height, cfg.buffers, cfg.ack_timeout_ms);
+            cfg.width, cfg.height, cfg.buffers, cfg.ack_timeout_ms,
+            cfg.peer_domid);
 
     gettimeofday(&start_tv, NULL);
 
