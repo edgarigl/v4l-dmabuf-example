@@ -394,6 +394,19 @@ int main(int argc, char **argv)
         goto out;
     }
 
+    /*
+     * Export all queue buffers before STREAMON. If this times out, backend
+     * export/import support is likely missing or broken on this QEMU build.
+     */
+    for (i = 0; i < cfg.buffers; i++) {
+        if (export_handle_for_buffer(vfd, V4L2_BUF_TYPE_VIDEO_CAPTURE, i,
+                                     &bufs[i]) < 0) {
+            fprintf(stderr,
+                    "export failed before STREAMON; cannot continue zero-copy mode\n");
+            goto out;
+        }
+    }
+
     /* Queue all capture buffers before STREAMON to start a steady pipeline. */
     for (i = 0; i < cfg.buffers; i++) {
         if (queue_index(vfd, i) < 0) {
@@ -470,13 +483,6 @@ int main(int argc, char **argv)
         if (buf.index >= cfg.buffers) {
             fprintf(stderr, "invalid DQBUF index %u\n", buf.index);
             goto out;
-        }
-
-        /* Export each queue buffer once, then reuse its handle id every frame. */
-        if (!bufs[buf.index].exported) {
-            if (export_handle_for_buffer(vfd, buf.type, buf.index, &bufs[buf.index]) < 0) {
-                goto out;
-            }
         }
 
         bytesused = buf.bytesused;
