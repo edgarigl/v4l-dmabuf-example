@@ -179,6 +179,7 @@ int send_all(int fd, const void *buf, size_t len)
             return -1;
         }
         if (ret == 0) {
+            errno = EPIPE;
             return -1;
         }
 
@@ -204,6 +205,7 @@ int recv_all(int fd, void *buf, size_t len)
             return -1;
         }
         if (ret == 0) {
+            errno = ECONNRESET;
             return -1;
         }
 

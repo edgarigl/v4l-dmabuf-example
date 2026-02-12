@@ -143,12 +143,16 @@ Options:
 - `-f <fourcc>` pixel format as 4 chars (default `YUYV`)
 - `-b <count>` MMAP buffer count (default `4`)
 - `-n <frames>` stop after N frames (default unlimited)
+- `-k <ms>` ACK wait timeout in ms (default `200`)
 
 ### Synchronization model
 
 `sender_zc` waits for one ACK from `receiver_zc` per frame before requeueing the
 capture buffer. This is a simple ownership protocol for demos where explicit
 cross-guest fence support is not available.
+
+If ACK packets are delayed or missing, `sender_zc` times out after `-k` and
+continues (with a warning) so capture does not stall permanently.
 
 ## SDL/DRM and virtio-gpu
 

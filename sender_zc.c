@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -32,6 +33,7 @@ struct sender_cfg {
     uint32_t pixelformat;
     uint32_t buffers;
     int frame_limit;
+    int ack_timeout_ms;
 };
 
 static void usage(const char *prog)
@@ -46,7 +48,8 @@ static void usage(const char *prog)
             "  -H <height>   Capture height (default 480)\n"
             "  -f <fourcc>   Pixel format (default YUYV)\n"
             "  -b <count>    Buffer count (default 4)\n"
-            "  -n <frames>   Stop after N frames (default: unlimited)\n",
+            "  -n <frames>   Stop after N frames (default: unlimited)\n"
+            "  -k <ms>       ACK wait timeout in milliseconds (default 200)\n",
             prog);
 }
 
@@ -63,9 +66,10 @@ static int parse_args(int argc, char **argv, struct sender_cfg *cfg)
         .pixelformat = v4l2_fourcc('Y', 'U', 'Y', 'V'),
         .buffers = 4,
         .frame_limit = -1,
+        .ack_timeout_ms = 200,
     };
 
-    while ((c = getopt(argc, argv, "d:a:p:W:H:f:b:n:h")) != -1) {
+    while ((c = getopt(argc, argv, "d:a:p:W:H:f:b:n:k:h")) != -1) {
         switch (c) {
         case 'd':
             cfg->device = optarg;
@@ -90,6 +94,13 @@ static int parse_args(int argc, char **argv, struct sender_cfg *cfg)
             break;
         case 'n':
             cfg->frame_limit = (int)strtol(optarg, NULL, 10);
+            break;
+        case 'k':
+            cfg->ack_timeout_ms = (int)strtol(optarg, NULL, 10);
+            if (cfg->ack_timeout_ms < 0) {
+                fprintf(stderr, "ack timeout must be >= 0\n");
+                return -1;
+            }
             break;
         case 'h':
         default:
@@ -282,6 +293,7 @@ int main(int argc, char **argv)
     int vfd = -1;
     int sock = -1;
     int rc = 1;
+    bool ack_timeout_warned = false;
     uint32_t i;
 
     if (parse_args(argc, argv, &cfg) < 0) {
@@ -321,6 +333,19 @@ int main(int argc, char **argv)
         goto out;
     }
 
+    if (cfg.ack_timeout_ms > 0) {
+        struct timeval tv = {
+            .tv_sec = cfg.ack_timeout_ms / 1000,
+            .tv_usec = (cfg.ack_timeout_ms % 1000) * 1000,
+        };
+
+        if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+            fprintf(stderr, "setsockopt(SO_RCVTIMEO) failed: %s\n",
+                    strerror(errno));
+            goto out;
+        }
+    }
+
     hello.magic = STREAM_MAGIC;
     hello.version = PROTO_VERSION;
     hello.width = cfg.width;
@@ -336,9 +361,9 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr,
-            "zero-copy sender: %s -> %s:%u (%ux%u buffers=%u)\n",
+            "zero-copy sender: %s -> %s:%u (%ux%u buffers=%u ack_timeout=%dms)\n",
             cfg.device, cfg.peer_ip, cfg.port,
-            cfg.width, cfg.height, cfg.buffers);
+            cfg.width, cfg.height, cfg.buffers, cfg.ack_timeout_ms);
 
     gettimeofday(&start_tv, NULL);
 
@@ -399,16 +424,24 @@ int main(int argc, char **argv)
          * This preserves ownership ordering without extra fencing support.
          */
         if (recv_all(sock, &ack_net, sizeof(ack_net)) < 0) {
-            fprintf(stderr, "failed to receive ACK\n");
-            goto out;
-        }
-        net_to_host_zc_ack(&ack, &ack_net);
-        if (ack.magic != FRAME_MAGIC || ack.status != 0 ||
-            ack.handle_id != pkt.handle_id || ack.sequence != pkt.sequence) {
-            fprintf(stderr,
-                    "invalid ACK (magic=0x%x status=%u handle=%" PRIu64 " seq=%" PRIu64 ")\n",
-                    ack.magic, ack.status, ack.handle_id, ack.sequence);
-            goto out;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (!ack_timeout_warned) {
+                    fprintf(stderr,
+                            "ACK timeout reached; continuing without strict per-frame ACK\n");
+                    ack_timeout_warned = true;
+                }
+            } else {
+                fprintf(stderr, "failed to receive ACK: %s\n", strerror(errno));
+                goto out;
+            }
+        } else {
+            net_to_host_zc_ack(&ack, &ack_net);
+            if (ack.magic != FRAME_MAGIC || ack.status != 0 ||
+                ack.handle_id != pkt.handle_id || ack.sequence != pkt.sequence) {
+                fprintf(stderr,
+                        "ignoring mismatched ACK (magic=0x%x status=%u handle=%" PRIu64 " seq=%" PRIu64 ")\n",
+                        ack.magic, ack.status, ack.handle_id, ack.sequence);
+            }
         }
 
         if (queue_index(vfd, buf.index) < 0) {
